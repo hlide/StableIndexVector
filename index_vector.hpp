@@ -13,7 +13,7 @@ namespace siv
     /// Stable identifier type. Maps to an object through the index indirection layer.
     using id_type = uint64_t;
 
-    static constexpr id_type invalid_id = std::numeric_limits<id_type>::max();
+    inline constexpr id_type invalid_id = std::numeric_limits<id_type>::max();
 
     template<typename T>
     class vector;
@@ -28,12 +28,6 @@ namespace siv
     {
     public:
         handle() = default;
-
-        handle(id_type id, id_type generation, vector<T>* vec)
-            : m_id{id}
-            , m_generation{generation}
-            , m_vector{vec}
-        {}
 
         T* operator->()
         {
@@ -83,6 +77,12 @@ namespace siv
         }
 
     private:
+        handle(id_type id, id_type generation, vector<T>* vec)
+            : m_id{id}
+            , m_generation{generation}
+            , m_vector{vec}
+        {}
+
         id_type    m_id         = 0;
         id_type    m_generation = 0;
         vector<T>* m_vector     = nullptr;
@@ -232,6 +232,7 @@ namespace siv
         /** Copies the provided object at the end of the vector
          *  @return The stable ID to retrieve the object
          */
+        [[nodiscard]]
         id_type push_back(const T& value)
         {
             const id_type id = get_free_slot();
@@ -242,6 +243,7 @@ namespace siv
         /** Moves the provided object at the end of the vector
          *  @return The stable ID to retrieve the object
          */
+        [[nodiscard]]
         id_type push_back(T&& value)
         {
             const id_type id = get_free_slot();
@@ -253,6 +255,7 @@ namespace siv
          *  @return The stable ID to retrieve the object
          */
         template<typename... Args>
+        [[nodiscard]]
         id_type emplace_back(Args&&... args)
         {
             const id_type id = get_free_slot();
@@ -326,6 +329,7 @@ namespace siv
         [[nodiscard]]
         size_type index_of(id_type id) const
         {
+            assert(id < m_indexes.size() && "ID out of range");
             return m_indexes[id];
         }
 
@@ -363,6 +367,7 @@ namespace siv
         [[nodiscard]]
         id_type generation(id_type id) const
         {
+            assert(id < m_indexes.size() && "ID out of range");
             return m_metadata[m_indexes[id]].generation;
         }
 
@@ -409,6 +414,10 @@ namespace siv
                 return m_metadata[m_data.size()].rid;
             }
             const id_type new_id = m_data.size();
+            // Reserve both before modifying either to prevent desync on allocation failure
+            m_indexes.reserve(m_indexes.size() + 1);
+            m_metadata.reserve(m_metadata.size() + 1);
+            // After successful reserves, push_back on trivial types cannot throw
             m_metadata.push_back({new_id, 0});
             m_indexes.push_back(new_id);
             return new_id;
@@ -437,6 +446,8 @@ namespace siv
         return old_size - v.size();
     }
 
+    /// @note Comparisons operate on elements in data-order (internal storage order),
+    /// which may differ from insertion order after deletions (swap-to-back).
     template<typename T>
     bool operator==(const vector<T>& lhs, const vector<T>& rhs)
     {

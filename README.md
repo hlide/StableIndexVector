@@ -9,7 +9,7 @@ A header-only C++17 library providing a vector container with stable IDs for acc
 - **Cache-Friendly**: Data stored contiguously in memory for efficient iteration
 - **STL-Compatible**: Familiar `std::vector`-like interface (iterators, type aliases, `at()`, `front()`, `back()`, etc.)
 - **Header-Only**: Single header file, easy to integrate
-- **Exception-Safe**: Works with both `-fexceptions` and `-fno-exceptions`
+- **`-fno-exceptions` Compatible**: Works with both `-fexceptions` and `-fno-exceptions`
 
 ## Installation
 
@@ -103,12 +103,12 @@ Entity* ptr = entities.data();
 ```cpp
 // Member function
 entities.erase_if([](const Entity& e) {
-    return e.health <= 0;
+    return e.x < 0;
 });
 
 // Free function (C++20 style) - returns number of elements removed
 auto removed = siv::erase_if(entities, [](const Entity& e) {
-    return e.health <= 0;
+    return e.x < 0;
 });
 ```
 
