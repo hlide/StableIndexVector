@@ -1,432 +1,477 @@
 #pragma once
-#include <limits>
-#include <vector>
+
+#include <algorithm>
 #include <cassert>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <vector>
 
 
 namespace siv
 {
-    /** Alias the differentiate between IDs and index.
-     * An ID allows to access the data through the index vector and is associated with the same object until its erased.
-     * An index is simply the current position of the object in the data vector and may change with deletions.
-     */
-    using ID = uint64_t;
+    /// Stable identifier type. Maps to an object through the index indirection layer.
+    using id_type = uint64_t;
 
-    static constexpr ID InvalidID = std::numeric_limits<ID>::max();
+    static constexpr id_type invalid_id = std::numeric_limits<id_type>::max();
 
-    /// Forward declaration
-    template<typename TObjectType>
-    class Vector;
+    template<typename T>
+    class vector;
 
-    /** A standalone struct allowing to access an object without the need to have a reference to the containing Vector.
+    /** A standalone smart reference to an object managed by a siv::vector.
+     *  Tracks validity via a generation counter to detect use-after-erase.
      *
-     * @tparam TObjectType The type of the object
+     * @tparam T The type of the referenced object
      */
-    /** Standalone object to access an object
-     *
-     * @tparam TObjectType The object's type
-     */
-    template<typename TObjectType>
-    class Handle
+    template<typename T>
+    class handle
     {
     public:
-        /// Default constructor
-        Handle() = default;
-        /// Constructor
-        Handle(ID id, ID validity_id, Vector<TObjectType>* vector)
+        handle() = default;
+
+        handle(id_type id, id_type generation, vector<T>* vec)
             : m_id{id}
-            , m_validity_id{validity_id}
-            , m_vector{vector}
+            , m_generation{generation}
+            , m_vector{vec}
         {}
 
-        /// Pointer-like access to the underlying object
-        TObjectType* operator->()
+        T* operator->()
         {
+            assert(valid() && "Dereferencing invalid handle");
             return &(*m_vector)[m_id];
         }
 
-        /// Const pointer-like access to the object
-        TObjectType const* operator->() const
+        const T* operator->() const
         {
+            assert(valid() && "Dereferencing invalid handle");
             return &(*m_vector)[m_id];
         }
 
-        /// Dereference operator
-        TObjectType& operator*()
+        T& operator*()
         {
+            assert(valid() && "Dereferencing invalid handle");
             return (*m_vector)[m_id];
         }
 
-        /// Dereference constant operator
-        TObjectType const& operator*() const
+        const T& operator*() const
         {
+            assert(valid() && "Dereferencing invalid handle");
             return (*m_vector)[m_id];
         }
 
-        /// Returns the ID of the associated object
         [[nodiscard]]
-        ID getID() const
+        id_type id() const noexcept
         {
             return m_id;
         }
 
-        /** Bool operator to test against the validity of the reference
-         *
-         * @return false if uninitialized or if the object has been erased from the vector, true otherwise
-         */
-        explicit operator bool() const
+        [[nodiscard]]
+        id_type generation() const noexcept
         {
-            return isValid();
+            return m_generation;
         }
 
-        /** Check if the reference is associated with a vector and has a correct validity ID
-         *
-         * @return false if uninitialized or if the object has been erased from the vector, true otherwise
-         */
-        [[nodiscard]]
-        bool isValid() const
+        explicit operator bool() const noexcept
         {
-            return m_vector && m_vector->isValid(m_id, m_validity_id);
+            return valid();
+        }
+
+        [[nodiscard]]
+        bool valid() const noexcept
+        {
+            return m_vector && m_vector->is_valid(m_id, m_generation);
         }
 
     private:
-        /// The ID of the object.
-        ID                   m_id          = 0;
-        /// The validity ID of the object at the time of creation. Used to check the validity of the handle.
-        ID                   m_validity_id = 0;
-        /// A raw pointer to the vector containing the object associated with this handle
-        Vector<TObjectType>* m_vector      = nullptr;
+        id_type    m_id         = 0;
+        id_type    m_generation = 0;
+        vector<T>* m_vector     = nullptr;
 
-        /// Used to perform debug checks
-        friend class Vector<TObjectType>;
+        friend class vector<T>;
     };
 
-    /** A vector that provide stable IDs when adding objects.
-     * These IDs will still allow to access their associated objects even after inserting of removing other objects.
-     * This comes at the cost of a small overhead because of an additional indirection.
+    /** A vector providing stable IDs for element access.
+     *  IDs remain valid across insertions and deletions of other elements.
+     *  Data is stored contiguously for cache-friendly iteration.
      *
-     * @tparam TObjectType The type of the objects to be stored in the vector. It has to be movable.
+     * @tparam T The element type. Must be move-constructible and move-assignable.
      */
-    template<typename TObjectType>
-    class Vector
+    template<typename T>
+    class vector
     {
     public:
-        Vector() = default;
+        // -- Member types (std::vector compatible) --
+
+        using value_type             = T;
+        using size_type              = std::size_t;
+        using difference_type        = std::ptrdiff_t;
+        using reference              = T&;
+        using const_reference        = const T&;
+        using pointer                = T*;
+        using const_pointer          = const T*;
+        using iterator               = typename std::vector<T>::iterator;
+        using const_iterator         = typename std::vector<T>::const_iterator;
+        using reverse_iterator       = typename std::vector<T>::reverse_iterator;
+        using const_reverse_iterator = typename std::vector<T>::const_reverse_iterator;
+
+        // -- Constructors / assignment --
+
+        vector() = default;
+
+        /// Non-copyable and non-movable to prevent dangling handle pointers
+        vector(const vector&) = delete;
+        vector& operator=(const vector&) = delete;
+        vector(vector&&) = delete;
+        vector& operator=(vector&&) = delete;
+
+        // -- Element access --
+
+        /** Bounds-checked access by ID.
+         *  @throws std::out_of_range if exceptions are enabled, otherwise asserts
+         */
+        reference at(id_type id)
+        {
+            check_at(id);
+            return m_data[m_indexes[id]];
+        }
+
+        const_reference at(id_type id) const
+        {
+            check_at(id);
+            return m_data[m_indexes[id]];
+        }
+
+        /// Access element by stable ID (no bounds checking)
+        reference operator[](id_type id)
+        {
+            return m_data[m_indexes[id]];
+        }
+
+        const_reference operator[](id_type id) const
+        {
+            return m_data[m_indexes[id]];
+        }
+
+        reference front()
+        {
+            return m_data.front();
+        }
+
+        const_reference front() const
+        {
+            return m_data.front();
+        }
+
+        reference back()
+        {
+            return m_data.back();
+        }
+
+        const_reference back() const
+        {
+            return m_data.back();
+        }
+
+        pointer data() noexcept
+        {
+            return m_data.data();
+        }
+
+        const_pointer data() const noexcept
+        {
+            return m_data.data();
+        }
+
+        // -- Iterators --
+
+        iterator       begin()        noexcept { return m_data.begin();   }
+        iterator       end()          noexcept { return m_data.end();     }
+        const_iterator begin()  const noexcept { return m_data.begin();   }
+        const_iterator end()    const noexcept { return m_data.end();     }
+        const_iterator cbegin() const noexcept { return m_data.cbegin();  }
+        const_iterator cend()   const noexcept { return m_data.cend();    }
+
+        reverse_iterator       rbegin()        noexcept { return m_data.rbegin();  }
+        reverse_iterator       rend()          noexcept { return m_data.rend();    }
+        const_reverse_iterator rbegin()  const noexcept { return m_data.rbegin();  }
+        const_reverse_iterator rend()    const noexcept { return m_data.rend();    }
+        const_reverse_iterator crbegin() const noexcept { return m_data.crbegin(); }
+        const_reverse_iterator crend()   const noexcept { return m_data.crend();   }
+
+        // -- Capacity --
+
+        [[nodiscard]] bool      empty()    const noexcept { return m_data.empty();    }
+        [[nodiscard]] size_type size()     const noexcept { return m_data.size();     }
+        [[nodiscard]] size_type max_size() const noexcept { return m_data.max_size(); }
+        [[nodiscard]] size_type capacity() const noexcept { return m_data.capacity(); }
+
+        void reserve(size_type new_cap)
+        {
+            m_data.reserve(new_cap);
+            m_metadata.reserve(new_cap);
+            m_indexes.reserve(new_cap);
+        }
+
+        /// Shrinks the data vector. Index/metadata vectors are not shrunk (needed for ID recycling).
+        void shrink_to_fit()
+        {
+            m_data.shrink_to_fit();
+        }
+
+        // -- Modifiers --
+
+        /// Removes all elements and invalidates all existing handles
+        void clear()
+        {
+            m_data.clear();
+            for (auto& m : m_metadata) {
+                ++m.generation;
+            }
+        }
 
         /** Copies the provided object at the end of the vector
-         *
-         * @param object The object to copy
-         * @return The ID to retrieve the object
+         *  @return The stable ID to retrieve the object
          */
-        ID push_back(const TObjectType& object)
+        id_type push_back(const T& value)
         {
-            const ID id = getFreeSlot();
-            m_data.push_back(object);
+            const id_type id = get_free_slot();
+            m_data.push_back(value);
             return id;
         }
 
-        /** Constructs an object in place
-         *
-         * @tparam TArgs Constructor arguments types
-         * @param args Constructor arguments
-         * @return The ID to retrieve the object
+        /** Moves the provided object at the end of the vector
+         *  @return The stable ID to retrieve the object
          */
-        template<typename... TArgs>
-        ID emplace_back(TArgs&&... args)
+        id_type push_back(T&& value)
         {
-            const ID id = getFreeSlot();
-            m_data.emplace_back(std::forward<TArgs>(args)...);
+            const id_type id = get_free_slot();
+            m_data.push_back(std::move(value));
             return id;
         }
 
-        /** Removes the object from the vector
-         *
-         * @param id The ID of the object to remove
+        /** Constructs an element in-place at the end of the vector
+         *  @return The stable ID to retrieve the object
          */
-        void erase(ID id)
+        template<typename... Args>
+        id_type emplace_back(Args&&... args)
         {
-            // Fetch relevant info
-            const ID data_id      = m_indexes[id];
-            const ID last_data_id = m_data.size() - 1;
-            const ID last_id      = m_metadata[last_data_id].rid;
-            // Update validity ID
-            ++m_metadata[data_id].validity_id;
-            // Swap the object to delete with the object at the end
-            std::swap(m_data[data_id], m_data[last_data_id]);
-            std::swap(m_metadata[data_id], m_metadata[last_data_id]);
+            const id_type id = get_free_slot();
+            m_data.emplace_back(std::forward<Args>(args)...);
+            return id;
+        }
+
+        /// Removes the last element in data order
+        void pop_back()
+        {
+            assert(!empty() && "pop_back on empty vector");
+            erase_at(m_data.size() - 1);
+        }
+
+        /** Removes the object referenced by the provided stable ID
+         *  @param id The stable ID of the object to remove
+         */
+        void erase(id_type id)
+        {
+            assert(id < m_indexes.size() && "ID out of range");
+            assert(m_indexes[id] < m_data.size() && "Object already erased or ID invalid");
+            const id_type data_idx      = m_indexes[id];
+            const id_type last_data_idx = m_data.size() - 1;
+            const id_type last_id       = m_metadata[last_data_idx].rid;
+            ++m_metadata[data_idx].generation;
+            std::swap(m_data[data_idx], m_data[last_data_idx]);
+            std::swap(m_metadata[data_idx], m_metadata[last_data_idx]);
             std::swap(m_indexes[id], m_indexes[last_id]);
-            // Destroy the object
             m_data.pop_back();
         }
 
-        /** Removes the object from the vector
-         *
-         * @param idx The index in the data vector of the object to remove
+        /** Removes the object referenced by the handle
+         *  @param h A handle to the object to remove
          */
-        void eraseViaData(uint32_t idx)
+        void erase(const handle<T>& h)
         {
+            assert(h.m_vector == this && "Handle does not belong to this vector");
+            assert(h.valid() && "Handle references an erased object");
+            erase(h.id());
+        }
+
+        /** Removes the object at the given data index
+         *  @param idx Position in the contiguous data array
+         */
+        void erase_at(size_type idx)
+        {
+            assert(idx < m_data.size() && "Index out of range");
             erase(m_metadata[idx].rid);
         }
 
-        /** Removes the object referenced by the handle from the vector
-         *
-         * @param handle The handle referencing the object to remove
+        /** Removes all elements matching the predicate (C++20-style member)
+         *  @param predicate Unary predicate returning true for elements to remove
          */
-        void erase(const Handle<TObjectType>& handle)
+        template<typename Pred>
+        void erase_if(Pred&& predicate)
         {
-            // Ensure the handle is from this vector
-            assert(handle.m_vector == this);
-            // Ensure the object hasn't already been erased
-            assert(handle.isValid());
-            erase(handle.getID());
-        }
-
-        /** Return the index in the data vector of the object referenced by the provided ID
-         *
-         * @param id The ID to find the data index of
-         * @return The index in the data vector associated with the ID
-         */
-        [[nodiscard]]
-        uint64_t getDataIndex(ID id) const
-        {
-            return m_indexes[id];
-        }
-
-        /** Access the object reference by the provided ID
-         *
-         * @param id The object's ID
-         * @return A reference to the object
-         */
-        TObjectType& operator[](ID id)
-        {
-            return m_data[m_indexes[id]];
-        }
-
-        /** Access the object reference by the provided ID
-         *
-         * @param id The object's ID
-         * @return A constant reference to the object
-         */
-         TObjectType const& operator[](ID id) const
-        {
-            return m_data[m_indexes[id]];
-        }
-
-        /// Returns the number of objects in the vector
-        [[nodiscard]]
-        size_t size() const
-        {
-            return m_data.size();
-        }
-
-        /// Tells if the vector is currently empty
-        [[nodiscard]]
-        bool empty() const
-        {
-            return m_data.empty();
-        }
-
-        /// Returns the vector's capacity (i.e. the number of allocated slots in the vector)
-        [[nodiscard]]
-        size_t capacity() const
-        {
-            return m_data.capacity();
-        }
-
-        /** Creates a handle pointing to the provided ID
-         *
-         * @param id The ID of the object
-         * @return A handle to the object
-         */
-        Handle<TObjectType> createHandle(ID id)
-        {
-            /* Ensure the object is valid. If the data index is greater than the current size
-             * it means that it has been swapped and removed. */
-            assert(getDataIndex(id) < size());
-            return {id, m_metadata[m_indexes[id]].validity_id, this};
-        }
-
-        /** Creates a handle to an object using its position in the data vector
-         *
-         * @param idx The index of the object in the data vector
-         * @return A handle to the object
-         */
-        Handle<TObjectType> createHandleFromData(uint64_t idx)
-        {
-            /* Ensure the object is valid. If the data index is greater than the current size
-             * it means that it has been swapped and removed. */
-            assert(idx < size());
-            return {m_metadata[idx].rid, m_metadata[idx].validity_id, this};
-        }
-
-        /** Checks if the provided object is still valid considering its last known validity ID
-         *
-         * @param id The ID of the object
-         * @param validity_id The last known validity ID
-         * @return True if the last known validity ID is equal to the current one
-         */
-        [[nodiscard]]
-        bool isValid(ID id, ID validity_id) const
-        {
-            return validity_id == m_metadata[m_indexes[id]].validity_id;
-        }
-
-        /// Begin iterator of the data vector
-        typename std::vector<TObjectType>::iterator begin() noexcept
-        {
-            return m_data.begin();
-        }
-
-        /// End iterator of the data vector
-        typename std::vector<TObjectType>::iterator end() noexcept
-        {
-            return m_data.end();
-        }
-
-        /// Const begin iterator of the data vector
-        typename std::vector<TObjectType>::const_iterator begin() const noexcept
-        {
-            return m_data.begin();
-        }
-
-        /// Const end iterator of the data vector
-        typename std::vector<TObjectType>::const_iterator end() const noexcept
-        {
-            return m_data.end();
-        }
-
-        /** Removes all objects that match the provided predicate
-         *
-         * @tparam TCallback The callback's type, any callable should be fine
-         * @param callback The predicate used to check an object has to be removed
-         */
-        template<typename TCallback>
-        void remove_if(TCallback&& predicate)
-        {
-            for (uint32_t i{0}; i < m_data.size();) {
+            for (size_type i{0}; i < m_data.size();) {
                 if (predicate(m_data[i])) {
-                    eraseViaData(i);
+                    erase_at(i);
                 } else {
                     ++i;
                 }
             }
         }
 
-        /** Pre allocates @p size slots in the vector
-         *
-         * @param size The number of slots to allocate in the vector
+        // -- Stable-ID specific operations --
+
+        /** Returns the current data index for the given ID
+         *  @param id The stable ID
          */
-        void reserve(size_t size)
-        {
-            m_data.reserve(size);
-            m_metadata.reserve(size);
-            m_indexes.reserve(size);
-        }
-
-        /// Return the validity ID associated with the provided ID
         [[nodiscard]]
-        ID getValidityID(ID id) const
+        size_type index_of(id_type id) const
         {
-            return m_metadata[m_indexes[id]].validity_id;
+            return m_indexes[id];
         }
 
-        /// Returns a raw pointer to the first element of the data vector
-        TObjectType* data()
+        /** Creates a handle pointing to the given stable ID
+         *  @param id The stable ID of a live object
+         */
+        handle<T> make_handle(id_type id)
         {
-            return m_data.data();
+            assert(id < m_indexes.size() && m_indexes[id] < m_data.size());
+            return {id, m_metadata[m_indexes[id]].generation, this};
         }
 
-        /// Returns a reference to the data vector
-        std::vector<TObjectType>& getData()
+        /** Creates a handle from a data index
+         *  @param idx Position in the contiguous data array
+         */
+        handle<T> make_handle_at(size_type idx)
         {
-            return m_data;
+            assert(idx < size());
+            return {m_metadata[idx].rid, m_metadata[idx].generation, this};
         }
 
-        /// Returns a constant reference to the data vector
-        const std::vector<TObjectType>& getData() const
-        {
-            return m_data;
-        }
-
-        /// Returns the ID that would be used if an object was added
+        /** Checks if an ID + generation pair still references a live object.
+         *  Used internally by handle::valid().
+         */
         [[nodiscard]]
-        ID getNextID() const
+        bool is_valid(id_type id, id_type generation) const noexcept
         {
-            // This means that we have available slots
+            if (id >= m_indexes.size() || m_indexes[id] >= m_metadata.size()) {
+                return false;
+            }
+            return generation == m_metadata[m_indexes[id]].generation;
+        }
+
+        /// Returns the generation counter for the given ID
+        [[nodiscard]]
+        id_type generation(id_type id) const
+        {
+            return m_metadata[m_indexes[id]].generation;
+        }
+
+        /// Returns the ID that would be assigned to the next inserted element
+        [[nodiscard]]
+        id_type next_id() const
+        {
             if (m_metadata.size() > m_data.size()) {
                 return m_metadata[m_data.size()].rid;
             }
             return m_data.size();
         }
 
-        /// Erase all objects and invalidates all slots
-        void clear()
-        {
-            // Remove all data
-            m_data.clear();
-
-            for (auto& m : m_metadata) {
-                // Invalidate all slots
-                ++m.validity_id;
-            }
-        }
-
+        /// Checks whether the ID references a currently live object
         [[nodiscard]]
-        bool isValidID(siv::ID id) const
+        bool contains(id_type id) const noexcept
         {
-            return id < m_indexes.size();
+            return id < m_indexes.size() && m_indexes[id] < m_data.size();
         }
 
     private:
-        /** Creates a new slot in the vector
-         *
-         * @note If a slot is available it will be reused, if not a new one will be created.
-         *
-         * @return The ID of the newly created slot.
-         */
-        ID getFreeSlot()
+        void check_at(id_type id) const
         {
-            const ID id = getFreeID();
+            if (id >= m_indexes.size() || m_indexes[id] >= m_data.size()) {
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
+                throw std::out_of_range("siv::vector::at: invalid id");
+#else
+                assert(false && "siv::vector::at: invalid id");
+#endif
+            }
+        }
+
+        id_type get_free_slot()
+        {
+            const id_type id = get_free_id();
             m_indexes[id] = m_data.size();
             return id;
         }
 
-        /** Gets a ID to a free slot.
-         *
-         * @note If an ID is available it will be reused, if not a new one will be created.
-         *
-         * @return An ID of a free slot.
-         */
-        ID getFreeID()
+        id_type get_free_id()
         {
-            // This means that we have available slots
             if (m_metadata.size() > m_data.size()) {
-                // Update the validity ID
-                ++m_metadata[m_data.size()].validity_id;
+                ++m_metadata[m_data.size()].generation;
                 return m_metadata[m_data.size()].rid;
             }
-            // A new slot has to be created
-            const ID new_id = m_data.size();
+            const id_type new_id = m_data.size();
             m_metadata.push_back({new_id, 0});
             m_indexes.push_back(new_id);
             return new_id;
         }
 
-    private:
-        /// The struct holding additional information about an object
-        struct Metadata
+        struct metadata
         {
-            /// The reverse ID, allowing to retrieve the ID of the object from the data vector.
-            ID rid         = 0;
-            /// An identifier that is changed when the object is erased, used to ensure a handle is still valid.
-            ID validity_id = 0;
+            id_type rid        = 0;
+            id_type generation = 0;
         };
 
-        /// The vector holding the actual objects.
-        std::vector<TObjectType> m_data;
-        /// The vector holding the associated metadata. It is accessed using the same index as for the data vector.
-        std::vector<Metadata>    m_metadata;
-        /// The vector that stores the data index for each ID.
-        std::vector<ID>          m_indexes;
+        std::vector<T>        m_data;
+        std::vector<metadata> m_metadata;
+        std::vector<id_type>  m_indexes;
     };
+
+    // -- Non-member functions --
+
+    /// Erases all elements matching the predicate (C++20-style free function)
+    /// @return The number of elements removed
+    template<typename T, typename Pred>
+    typename vector<T>::size_type erase_if(vector<T>& v, Pred predicate)
+    {
+        const auto old_size = v.size();
+        v.erase_if(std::move(predicate));
+        return old_size - v.size();
+    }
+
+    template<typename T>
+    bool operator==(const vector<T>& lhs, const vector<T>& rhs)
+    {
+        return lhs.size() == rhs.size()
+            && std::equal(lhs.begin(), lhs.end(), rhs.begin());
+    }
+
+    template<typename T>
+    bool operator!=(const vector<T>& lhs, const vector<T>& rhs)
+    {
+        return !(lhs == rhs);
+    }
+
+    template<typename T>
+    bool operator<(const vector<T>& lhs, const vector<T>& rhs)
+    {
+        return std::lexicographical_compare(lhs.begin(), lhs.end(),
+                                            rhs.begin(), rhs.end());
+    }
+
+    template<typename T>
+    bool operator<=(const vector<T>& lhs, const vector<T>& rhs)
+    {
+        return !(rhs < lhs);
+    }
+
+    template<typename T>
+    bool operator>(const vector<T>& lhs, const vector<T>& rhs)
+    {
+        return rhs < lhs;
+    }
+
+    template<typename T>
+    bool operator>=(const vector<T>& lhs, const vector<T>& rhs)
+    {
+        return !(lhs < rhs);
+    }
 }
