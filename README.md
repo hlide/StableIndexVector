@@ -243,6 +243,18 @@ siv::vector<Entity, my_allocator<Entity>> entities2(alloc);
 - Generation counters detect use-after-erase scenarios
 - Deleted ID slots are recycled on the next insertion
 
+## Safety & Design Guarantees
+
+- **Double-erase protection**: `erase(id)` asserts that the ID is valid and the object has not already been erased
+- **Handle validity tracking**: Handles use generation counters to detect use-after-erase; dereferencing an invalid handle triggers an assertion
+- **No dangling handle pointers**: `siv::vector` is non-copyable and non-movable, preventing handles from pointing to a destroyed container
+- **Bounds-checked access**: `at(id)` throws `std::out_of_range` (or asserts with `-fno-exceptions`); `generation()` and `index_of()` assert on invalid IDs
+- **`[[nodiscard]]` on insertions**: `push_back` and `emplace_back` return values cannot be silently discarded
+- **Exception safety**: Basic guarantee with self-recovery. Internal metadata uses reserve-before-modify to prevent desync on allocation failure. If element construction throws, the recycled slot is reclaimed on the next insertion
+- **Allocator propagation**: Custom allocators are properly rebound for internal metadata and index vectors via `std::allocator_traits::rebind_alloc`
+- **Comparison semantics**: Comparison operators operate on data-order (internal storage order), which may differ from insertion order after deletions
+- **Thread safety**: Same guarantees as `std::vector` — concurrent reads are safe, concurrent writes require external synchronization
+
 ## Requirements
 
 - C++17 or later
