@@ -7,6 +7,7 @@ A header-only C++17 library providing a vector container with stable IDs for acc
 - **Stable IDs**: Objects are accessed via IDs that remain valid regardless of other insertions/deletions
 - **Handle System**: Smart handle objects with generation tracking to detect use-after-erase
 - **Cache-Friendly**: Data stored contiguously in memory for efficient iteration
+- **Custom Allocator Support**: `siv::vector<T, Allocator>` with allocator propagation, like `std::vector`
 - **STL-Compatible**: Familiar `std::vector`-like interface (iterators, type aliases, `at()`, `front()`, `back()`, etc.)
 - **Header-Only**: Single header file, easy to integrate
 - **`-fno-exceptions` Compatible**: Works with both `-fexceptions` and `-fno-exceptions`
@@ -112,15 +113,40 @@ auto removed = siv::erase_if(entities, [](const Entity& e) {
 });
 ```
 
+### Custom Allocator
+
+Use a custom allocator just like `std::vector`:
+
+```cpp
+#include <memory>
+
+// Pool allocator, tracking allocator, etc.
+template<typename T>
+using my_allocator = std::allocator<T>; // your custom allocator
+
+siv::vector<Entity, my_allocator<Entity>> entities;
+siv::id_type id = entities.push_back({0, 0, "Test"});
+
+// Handles carry the allocator type
+siv::handle<Entity, my_allocator<Entity>> h = entities.make_handle(id);
+
+// Or construct with an allocator instance
+my_allocator<Entity> alloc;
+siv::vector<Entity, my_allocator<Entity>> entities2(alloc);
+```
+
 ## API Reference
 
-### `siv::vector<T>`
+### `siv::vector<T, Allocator>`
+
+`Allocator` defaults to `std::allocator<T>`.
 
 #### Member Types
 
 | Type | Definition |
 |------|------------|
 | `value_type` | `T` |
+| `allocator_type` | `Allocator` |
 | `size_type` | `std::size_t` |
 | `difference_type` | `std::ptrdiff_t` |
 | `reference` / `const_reference` | `T&` / `const T&` |
@@ -147,6 +173,7 @@ auto removed = siv::erase_if(entities, [](const Entity& e) {
 | `capacity()` | Current allocated capacity |
 | `reserve(n)` | Pre-allocate memory |
 | `shrink_to_fit()` | Reduce memory to fit current size |
+| `get_allocator()` | Returns a copy of the allocator |
 
 #### Modifiers
 
@@ -182,7 +209,9 @@ auto removed = siv::erase_if(entities, [](const Entity& e) {
 | `index_of(id)` | Get the current data index for an ID |
 | `next_id()` | Peek at the next ID that would be assigned |
 
-### `siv::handle<T>`
+### `siv::handle<T, Allocator>`
+
+`Allocator` defaults to `std::allocator<T>`. Must match the allocator of the owning `siv::vector`.
 
 | Method | Description |
 |--------|-------------|

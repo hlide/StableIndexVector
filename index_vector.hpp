@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -15,15 +16,16 @@ namespace siv
 
     inline constexpr id_type invalid_id = std::numeric_limits<id_type>::max();
 
-    template<typename T>
+    template<typename T, typename Allocator = std::allocator<T>>
     class vector;
 
     /** A standalone smart reference to an object managed by a siv::vector.
      *  Tracks validity via a generation counter to detect use-after-erase.
      *
      * @tparam T The type of the referenced object
+     * @tparam Allocator The allocator type used by the owning vector
      */
-    template<typename T>
+    template<typename T, typename Allocator = std::allocator<T>>
     class handle
     {
     public:
@@ -77,17 +79,17 @@ namespace siv
         }
 
     private:
-        handle(id_type id, id_type generation, vector<T>* vec)
+        handle(id_type id, id_type generation, vector<T, Allocator>* vec)
             : m_id{id}
             , m_generation{generation}
             , m_vector{vec}
         {}
 
-        id_type    m_id         = 0;
-        id_type    m_generation = 0;
-        vector<T>* m_vector     = nullptr;
+        id_type                m_id         = 0;
+        id_type                m_generation = 0;
+        vector<T, Allocator>*  m_vector     = nullptr;
 
-        friend class vector<T>;
+        friend class vector<T, Allocator>;
     };
 
     /** A vector providing stable IDs for element access.
@@ -95,28 +97,45 @@ namespace siv
      *  Data is stored contiguously for cache-friendly iteration.
      *
      * @tparam T The element type. Must be move-constructible and move-assignable.
+     * @tparam Allocator The allocator type. Defaults to std::allocator<T>.
      */
-    template<typename T>
+    template<typename T, typename Allocator>
     class vector
     {
+        struct metadata
+        {
+            id_type rid        = 0;
+            id_type generation = 0;
+        };
+
+        using metadata_allocator_type = typename std::allocator_traits<Allocator>::template rebind_alloc<metadata>;
+        using index_allocator_type    = typename std::allocator_traits<Allocator>::template rebind_alloc<id_type>;
+
     public:
         // -- Member types (std::vector compatible) --
 
         using value_type             = T;
+        using allocator_type         = Allocator;
         using size_type              = std::size_t;
         using difference_type        = std::ptrdiff_t;
         using reference              = T&;
         using const_reference        = const T&;
         using pointer                = T*;
         using const_pointer          = const T*;
-        using iterator               = typename std::vector<T>::iterator;
-        using const_iterator         = typename std::vector<T>::const_iterator;
-        using reverse_iterator       = typename std::vector<T>::reverse_iterator;
-        using const_reverse_iterator = typename std::vector<T>::const_reverse_iterator;
+        using iterator               = typename std::vector<T, Allocator>::iterator;
+        using const_iterator         = typename std::vector<T, Allocator>::const_iterator;
+        using reverse_iterator       = typename std::vector<T, Allocator>::reverse_iterator;
+        using const_reverse_iterator = typename std::vector<T, Allocator>::const_reverse_iterator;
 
         // -- Constructors / assignment --
 
         vector() = default;
+
+        explicit vector(const Allocator& alloc)
+            : m_data(alloc)
+            , m_metadata(metadata_allocator_type(alloc))
+            , m_indexes(index_allocator_type(alloc))
+        {}
 
         /// Non-copyable and non-movable to prevent dangling handle pointers
         vector(const vector&) = delete;
@@ -218,6 +237,13 @@ namespace siv
             m_data.shrink_to_fit();
         }
 
+        /// Returns a copy of the allocator
+        [[nodiscard]]
+        allocator_type get_allocator() const noexcept
+        {
+            return m_data.get_allocator();
+        }
+
         // -- Modifiers --
 
         /// Removes all elements and invalidates all existing handles
@@ -290,7 +316,7 @@ namespace siv
         /** Removes the object referenced by the handle
          *  @param h A handle to the object to remove
          */
-        void erase(const handle<T>& h)
+        void erase(const handle<T, Allocator>& h)
         {
             assert(h.m_vector == this && "Handle does not belong to this vector");
             assert(h.valid() && "Handle references an erased object");
@@ -336,7 +362,7 @@ namespace siv
         /** Creates a handle pointing to the given stable ID
          *  @param id The stable ID of a live object
          */
-        handle<T> make_handle(id_type id)
+        handle<T, Allocator> make_handle(id_type id)
         {
             assert(id < m_indexes.size() && m_indexes[id] < m_data.size());
             return {id, m_metadata[m_indexes[id]].generation, this};
@@ -345,7 +371,7 @@ namespace siv
         /** Creates a handle from a data index
          *  @param idx Position in the contiguous data array
          */
-        handle<T> make_handle_at(size_type idx)
+        handle<T, Allocator> make_handle_at(size_type idx)
         {
             assert(idx < size());
             return {m_metadata[idx].rid, m_metadata[idx].generation, this};
@@ -423,23 +449,17 @@ namespace siv
             return new_id;
         }
 
-        struct metadata
-        {
-            id_type rid        = 0;
-            id_type generation = 0;
-        };
-
-        std::vector<T>        m_data;
-        std::vector<metadata> m_metadata;
-        std::vector<id_type>  m_indexes;
+        std::vector<T, Allocator>                      m_data;
+        std::vector<metadata, metadata_allocator_type>  m_metadata;
+        std::vector<id_type, index_allocator_type>      m_indexes;
     };
 
     // -- Non-member functions --
 
     /// Erases all elements matching the predicate (C++20-style free function)
     /// @return The number of elements removed
-    template<typename T, typename Pred>
-    typename vector<T>::size_type erase_if(vector<T>& v, Pred predicate)
+    template<typename T, typename Allocator, typename Pred>
+    typename vector<T, Allocator>::size_type erase_if(vector<T, Allocator>& v, Pred predicate)
     {
         const auto old_size = v.size();
         v.erase_if(std::move(predicate));
@@ -448,40 +468,40 @@ namespace siv
 
     /// @note Comparisons operate on elements in data-order (internal storage order),
     /// which may differ from insertion order after deletions (swap-to-back).
-    template<typename T>
-    bool operator==(const vector<T>& lhs, const vector<T>& rhs)
+    template<typename T, typename Allocator>
+    bool operator==(const vector<T, Allocator>& lhs, const vector<T, Allocator>& rhs)
     {
         return lhs.size() == rhs.size()
             && std::equal(lhs.begin(), lhs.end(), rhs.begin());
     }
 
-    template<typename T>
-    bool operator!=(const vector<T>& lhs, const vector<T>& rhs)
+    template<typename T, typename Allocator>
+    bool operator!=(const vector<T, Allocator>& lhs, const vector<T, Allocator>& rhs)
     {
         return !(lhs == rhs);
     }
 
-    template<typename T>
-    bool operator<(const vector<T>& lhs, const vector<T>& rhs)
+    template<typename T, typename Allocator>
+    bool operator<(const vector<T, Allocator>& lhs, const vector<T, Allocator>& rhs)
     {
         return std::lexicographical_compare(lhs.begin(), lhs.end(),
                                             rhs.begin(), rhs.end());
     }
 
-    template<typename T>
-    bool operator<=(const vector<T>& lhs, const vector<T>& rhs)
+    template<typename T, typename Allocator>
+    bool operator<=(const vector<T, Allocator>& lhs, const vector<T, Allocator>& rhs)
     {
         return !(rhs < lhs);
     }
 
-    template<typename T>
-    bool operator>(const vector<T>& lhs, const vector<T>& rhs)
+    template<typename T, typename Allocator>
+    bool operator>(const vector<T, Allocator>& lhs, const vector<T, Allocator>& rhs)
     {
         return rhs < lhs;
     }
 
-    template<typename T>
-    bool operator>=(const vector<T>& lhs, const vector<T>& rhs)
+    template<typename T, typename Allocator>
+    bool operator>=(const vector<T, Allocator>& lhs, const vector<T, Allocator>& rhs)
     {
         return !(lhs < rhs);
     }
